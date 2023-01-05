@@ -840,7 +840,7 @@ namespace Test.Lifetimes.Lifetimes
       var resCount = def.GetDynamicField("myResCount");
       Assert.AreEqual(2, resCount); //one is dead
       
-      var resourcesCapacity = def.GetDynamicField("myResources").GetDynamicProperty("Length");
+      var resourcesCapacity = def.GetDynamicField("myResources").GetDynamicField("AsArray").GetDynamicProperty("Length");
       Assert.AreEqual(2, resourcesCapacity); //one is dead
     }
 

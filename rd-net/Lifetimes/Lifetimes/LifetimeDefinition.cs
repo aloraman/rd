@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
@@ -133,6 +134,7 @@ namespace JetBrains.Lifetimes
     private static readonly BoolBitSlice ourAllowTerminationUnderExecutionSlice = BitSlice.Bool(ourVerboseDiagnosticsSlice);
     private static readonly BoolBitSlice ourLogErrorAfterExecution = BitSlice.Bool(ourAllowTerminationUnderExecutionSlice);
     private static readonly Enum32BitSlice<LifetimeTerminationTimeoutKind> ourTerminationTimeoutKindSlice = BitSlice.Enum<LifetimeTerminationTimeoutKind>(ourLogErrorAfterExecution);
+    private static readonly BoolBitSlice ourResourcesHeapSpillSlice = BitSlice.Bool(ourTerminationTimeoutKindSlice);
 
     private static readonly int[] ourTerminationTimeoutMs = { 250, 5000, 30000 };
     
@@ -146,7 +148,7 @@ namespace JetBrains.Lifetimes
     
     private int myResCount;
     //in fact we could optimize footprint even better by changing `object[]` to `object` for single object 
-    private object?[]? myResources = new object[ResourcesInitialCapacity];
+    private OneOrMany myResources;
 
     // myState must be volatile to avoid some jit optimizations
     // for example:
@@ -386,6 +388,16 @@ namespace JetBrains.Lifetimes
         }
       }
     }
+
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct OneOrMany
+    {
+      [FieldOffset(0)]
+      public object? AsObject;
+      [FieldOffset(0)]
+      public object?[] AsArray;
+    }
     
 
 
@@ -484,13 +496,22 @@ namespace JetBrains.Lifetimes
       
       // In fact here access to resources could be done without mutex because setting cancellation status of children is rather optimization than necessity
       var resources = myResources;
-      if (resources == null) return;
-      
-      //Math.min is to ensure that even if some other thread increased myResCount, we don't get IndexOutOfBoundsException
-      for (var i = Math.Min(myResCount, resources.Length) - 1; i >= 0; i--)  
+      if (resources.AsObject == null) return;
+
+      if (ourResourcesHeapSpillSlice[myState])
       {
-        (resources[i] as LifetimeDefinition)?.MarkCancelingRecursively();
+        //Math.min is to ensure that even if some other thread increased myResCount, we don't get IndexOutOfBoundsException
+        for (var i = Math.Min(myResCount, resources.AsArray.Length) - 1; i >= 0; i--)  
+        {
+          (resources.AsArray[i] as LifetimeDefinition)?.MarkCancelingRecursively();
+        }
       }
+      else
+      {
+         (resources.AsObject as LifetimeDefinition)?.MarkCancelingRecursively();
+      }
+      
+      
     }
 
 #if !NET35
@@ -504,13 +525,22 @@ namespace JetBrains.Lifetimes
       //no one can take mutex after this point
 
       var resources = myResources;
-      Assertion.Assert(resources != null, "{0}: `resources` can't be null on destructuring stage", this);
+      //Assertion.Assert(resources != null, "{0}: `resources` can't be null on destructuring stage", this);
       
       for (var i = myResCount - 1; i >= 0; i--)
       {
+        object? resource;
+        if (ourResourcesHeapSpillSlice[myState])
+        {
+          resource = resources.AsArray[i];
+        }
+        else
+        {
+          resource = resources.AsObject;
+        }
         try
         {
-          switch (resources[i])
+          switch (resource)
           {
             case Action a:
               a();
@@ -529,17 +559,17 @@ namespace JetBrains.Lifetimes
               break;
 
             default:
-              Log.Error("{0}: unknown type of termination resource: {1}", this, resources[i]);
+              Log.Error("{0}: unknown type of termination resource: {1}", this, resource);
               break;
           }
         }
         catch (Exception e)
         {
-          Log.Error(e, $"{this}: exception on termination of resource[{i}]: ${resources[i]}");
+          Log.Error(e, $"{this}: exception on termination of resource[{i}]: ${resource}");
         }
       }
 
-      myResources = null;
+      myResources = default;
       myResCount = 0;
       
       //In fact we shouldn't make it, because it should provide stable CancellationToken to finish enclosing tasks in Canceled state (not Faulted)
@@ -588,27 +618,49 @@ namespace JetBrains.Lifetimes
           return false;
 
         var resources = myResources;
-        Assertion.Assert(resources != null, "{0}: `resources` can't be null under mutex while status < Terminating", this);
-        
-        if (myResCount == resources.Length)
+        if (ourResourcesHeapSpillSlice[myState])
         {
-          var countAfterCleaning = 0;
-          for (var i = 0; i < myResCount; i++)
+          if (myResCount == resources.AsArray.Length)
           {
-            //can't clear Canceling because TryAdd works in Canceling state 
-            if (resources[i] is LifetimeDefinition ld && ld.Status >= LifetimeStatus.Terminating)
-              resources[i] = null;
-            else
-              resources[countAfterCleaning++] = resources[i];
+            var countAfterCleaning = 0;
+            for (var i = 0; i < myResCount; i++)
+            {
+              //can't clear Canceling because TryAdd works in Canceling state 
+              if (resources.AsArray[i] is LifetimeDefinition ld && ld.Status >= LifetimeStatus.Terminating)
+                resources.AsArray[i] = null;
+              else
+                resources.AsArray[countAfterCleaning++] = resources.AsArray[i];
+            }
+
+            myResCount = countAfterCleaning;
+            if (countAfterCleaning * 2 > resources.AsArray.Length)
+              Array.Resize(ref myResources.AsArray, countAfterCleaning * 2); //must be more than 1, so it always should be room for one more resource
           }
 
-          myResCount = countAfterCleaning;
-          if (countAfterCleaning * 2 > resources.Length)
-            Array.Resize(ref myResources, countAfterCleaning * 2); //must be more than 1, so it always should be room for one more resource
+          myResources.AsArray![myResCount++] = action;
+          return true;
         }
-
-        myResources![myResCount++] = action;
-        return true;
+        else
+        {
+          if (myResCount == 0 || resources.AsObject is LifetimeDefinition ld && ld.Status >= LifetimeStatus.Terminating)
+          {
+            myResCount = 1;
+            myResources.AsObject = action;
+          }
+          else
+          {
+            var old = resources.AsObject;
+            myResources.AsArray = new object?[2];
+            myResources.AsArray[0] = old;
+            myResources.AsArray[1] = action;
+            myResCount = 2;
+            ourResourcesHeapSpillSlice.InterlockedUpdate(ref myState, true);
+          }
+          return true;
+        }
+        //Assertion.Assert(resources != null, "{0}: `resources` can't be null under mutex while status < Terminating", this);
+        
+        
       }
     }
 
